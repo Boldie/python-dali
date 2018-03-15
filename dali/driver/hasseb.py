@@ -11,26 +11,45 @@ import usb.core
 ###############################################################################
 
 
+vid = 0x04cc
+pid = 0x0802
+
+class HassebUsbFactory(object):
+    def __init__(self):
+        pass
+
+    def getAllInterfaces(self):
+        devices = usb.core.find(idVendor=vid, idProduct=pid, find_all=True)
+        return [HassebUsb(device=dev) for dev in devices]
+
 class HassebUsb(object):
     """ Creates a server object which is able to communicate to the Hasseb DALI 
     Master device from http://hasseb.fi/ based on a NXP LPC1343 ARM microprocesor
     with open source firmware.    
     """
 
-    def __init__(self):
+    def __init__(self, device=None):
         self.ep = None
         self.epRead = None
+
+        if device is not None:
+            self._openDeviceByUSBDevice(dev)
     
     def _openDevice(self):
-        self.interface = 0
-        self.vid = 0x04cc
-        self.pid = 0x0802
-        self.dev = usb.core.find(idVendor=self.vid, idProduct=self.pid)
+        vid = 0x04cc
+        pid = 0x0802
+        dev = usb.core.find(idVendor=vid, idProduct=pid)
     
-        if self.dev is None:
+        if dev is None:
             raise IOError("Device with VID=%x and PID=%x not found"
-                          %(self.vid, self.pid) )
-        
+                          %(vid, pid) )
+
+        self._openDeviceByUSBDevice(dev)
+
+    def _openDeviceByUSBDevice(self, device):
+        self.interface = 0
+        self.dev = device
+
         if self.dev.is_kernel_driver_active(self.interface) is True:
             # print "but we need to detach kernel driver"
             self.dev.detach_kernel_driver(self.interface)
@@ -125,4 +144,4 @@ class HassebUsb(object):
 
         return response
 
-__all__ = ["HassebUsb"]
+__all__ = ["HassebUsb","HassebUsbFactory"]
