@@ -5,32 +5,162 @@ import argparse
 import logging
  
 log_format = '%(levelname)s: %(message)s'
-logging.basicConfig(format=log_format, level=logging.INFO)
+logging.basicConfig(format=log_format, level=logging.DEBUG)
 
 parser = argparse.ArgumentParser(description='A dali helper script usable for a DALI-USB interface.')
-parser.add_argument('mode', choices=['interactive', 'find', 'resetAndFind', 'query'])
-args = parser.parse_args()
 
+subparsers = parser.add_subparsers(dest="command",title="commands", metavar="COMMAND")
+cmd_interactive = subparsers.add_parser("interactive", help="Interactive console usage of this script for testing and actions.")
+cmd_find = subparsers.add_parser("find", help="Tries to find ballasts and assign short addresses to them if they have none.")
+cmd_resetAndFind = subparsers.add_parser("resetAndFind", help="Tries to find ballasts and assign a short-address to them.")
+cmd_query = subparsers.add_parser("query", help="Query all short addresses and records the set group and scene details.")
+cmd_apply = subparsers.add_parser("apply", help="Apply a settings file to the devices.")
+cmd_apply.add_argument('filename', type=str, help='filename to load data from')
+cmd_apply.add_argument('--with-device-config', dest="withDeviceConfig", action="store_true", default=False, help='Writes device settings')
+
+args = parser.parse_args()
 from dali.driver import hasseb
 d=hasseb.HassebUsb()
 d._openDevice()
-from dali.address import Broadcast
-from dali.address import Short
+from dali.address import *
 from dali.gear.general import *
-addr = Broadcast()
 
 from dali.gear.general import QueryDeviceType
-cmd = QueryDeviceType(Short(0))
-#d.send(cmd)
 
-#cmd = DAPC(Short(0), 99)
+import json
+logger = logging.getLogger(__name__)
 
-#cmd = DAPC(Broadcast(), 99)
-#d.send(DAPC(Short(0), 99))
-if args.mode == "interactive":
+class DaliDevicesState():
+    """
+    This class can be used to query and restore states / information for different
+    modules to the DALI bus or read it from the DALI bus and store / load things
+    from a JSON file.
+    """
+    def __init__(self):
+        self._initData()
+        
+    def _initData(self):
+        self.data = { "devices": {}, "groups": {}, "scenes": {} }
+    
+    def readFromJson(self, filename):
+        with open(filename) as data_file:    
+            data = json.load(data_file)
+         
+        #####################################################   
+        # Convert some stuff to better interpretable later
+        
+        # Ensure keys of groups are of type int
+        data["groups"] = {int(k): v for k, v in data["groups"].items()}
+        data["devices"] = {int(k): v for k, v in data["devices"].items()}
+        data["scenes"] = {int(k): v for k, v in data["scenes"].items()}
+        
+        newScenesData = {} 
+        for sceneId, sceneData in data["scenes"].iteritems():
+            singleScene = {}
+            for key, value in sceneData.iteritems():
+                for splitKey in key.split(","):
+                    if splitKey != "default":
+                        splitKey = int(splitKey)
+                    singleScene[splitKey] = value;
+            newScenesData[sceneId] = singleScene
+        data["scenes"] = newScenesData   
+        self.data = data
+        
+    def writeToJson(self, filename):
+        with open(filename, 'w') as outfile:
+            json.dump(self.data, outfile)
+            
+    def writeGroupsToDali(self, dali):        
+        logger.info("Writing group stuff to DALI-device")
+        
+        # Remark: Non named groups from file will be left untouched nor will be
+        # deleted from devices.
+        for deviceShortAddr in self.data["devices"].keys():
+            logging.debug("Device %u: Query for groupmask"%(deviceShortAddr))
+            # Get group info may speedup setting things later on.
+            grp = d.send(QueryGroupsZeroToSeven(deviceShortAddr))
+            grp2 = d.send(QueryGroupsEightToFifteen(deviceShortAddr))
+            groupMask = grp2.value.as_integer << 8 | grp.value.as_integer
+            logging.debug("Device %u: Groupmask: 0x%x"%(deviceShortAddr,groupMask))
+            
+            for groupId in range(16):
+                currentlyMemberOfGroup = (groupMask & (1<<groupId)) != 0
+                memberOfGroup=groupId in self.data["groups"] and deviceShortAddr in self.data["groups"][groupId]                
+                # logging.debug("Device %u / group %u: member: %r, newMember: %r"%(deviceShortAddr,groupId,currentlyMemberOfGroup,memberOfGroup))
+                if memberOfGroup != currentlyMemberOfGroup:
+                    logging.debug("Device %u: Correcting group (%u) assignment"%(deviceShortAddr,groupId))
+                    if memberOfGroup:
+                        dali.send( AddToGroup( Short(deviceShortAddr), groupId ))
+                    else:
+                        dali.send( RemoveFromGroup( Short(deviceShortAddr), groupId ))
+        logger.info("Writing group stuff to DALI-device was successful")
+                        
+    def writeScenesToDali(self, dali):
+        for (sceneId, sceneContent) in self.data["scenes"].iteritems():
+            logging.debug("Working on Scene %u"%(sceneId))      
+            for deviceShortAddr in self.data["devices"].keys():
+                sceneValue = None                
+                if deviceShortAddr in sceneContent:
+                    sceneValue = sceneContent[deviceShortAddr]
+                elif "default" in  sceneContent:
+                    sceneValue = sceneContent["default"]
+                
+                if sceneValue is not None:
+                    logging.debug("Device %u: Set scene level to %u"%(deviceShortAddr,sceneValue))      
+                    dali.send( DTR0(sceneValue) )
+                    dali.send( SetScene(deviceShortAddr,sceneId) )
+                    r = dali.send(QuerySceneLevel(deviceShortAddr,sceneId))
+                    if r.value.as_integer != sceneValue:
+                        logging.error("Device %u: Set scene level to %u FAILED (query retrieves: %u)"%(deviceShortAddr,sceneValue,r.value.as_integer))
+                else:
+                    logging.debug("Device %u: Remove from scene"%(deviceShortAddr))      
+                    dali.send( RemoveFromScene(Short(deviceShortAddr),sceneId) )
+                    
+    def writeDeviceSettingsToDali(self, dali):
+        logger.info("Writing device settings stuff to DALI-devices")
+        for deviceShortAddr, data in self.data["devices"].iteritems():
+            if "sysFailLevel" in data:
+                sfl = data["sysFailLevel"]
+                dali.send( DTR0(sfl) )
+                dali.send(SetSystemFailureLevel(deviceShortAddr))
+                r = dali.send(QuerySystemFailureLevel(deviceShortAddr))
+                if r.value.as_integer != sfl:
+                    logging.error("Device %u: Set system failure level to %u FAILED (query retrieves: %u)"%(deviceShortAddr,sfl,r.value.as_integer))
+            if "powerOnLevel" in data:
+                pol = data["powerOnLevel"]
+                dali.send( DTR0(pol) )
+                dali.send(SetPowerOnLevel(deviceShortAddr))
+                r = dali.send(QueryPowerOnLevel(deviceShortAddr))
+                if r.value.as_integer != pol:
+                    logging.error("Device %u: Set power on level to %u FAILED (query retrieves: %u)"%(deviceShortAddr,pol,r.value.as_integer))
+                
+                
+            
+    def writeToDali(self, dali):
+        self.writeGroupsToDali( dali )
+        self.writeScenesToDali( dali )
+        
+if args.command == "interactive":
+    try:
+        import rlcompleter  
+        import readline
+        readline.parse_and_bind("tab: complete")
+    except ImportError:
+        pass
+    
     import code
+    print(" Entering interactive mode. For e.g. to send the Value 99 to Dail bus use")
+    print(" > d.send(DAPC(Short(0), 99))")    
     code.interact(local=locals())
-if args.mode == "query":
+if args.command == "apply":
+    ds = DaliDevicesState()
+    ds.readFromJson(args.filename)
+    
+    if args.withDeviceConfig:
+        ds.writeDeviceSettingsToDali(d)
+    
+    ds.writeToDali(d)
+if args.command == "query":
     from dali.address import Short
     from dali.gear.general import EnableDeviceType
     from dali.gear.general import QueryDeviceType
@@ -77,7 +207,7 @@ if args.mode == "query":
                 logging.info(" -- {0}".format(r))
               
     raise SystemExit(0)      
-elif args.mode == "find" or args.mode == 'resetAndFind':
+elif args.command == "find" or args.command == 'resetAndFind':
     from dali.gear.general import Compare
     from dali.gear.general import Initialise
     from dali.gear.general import Randomise
@@ -251,7 +381,7 @@ elif args.mode == "find" or args.mode == 'resetAndFind':
                 self._switchToFullAssign()
                 return self.find_ballasts(broadcast=True)
     
-    finder = BallastFinder(d, interactive=True, assignOnlyUnassigned=args.mode!='resetAndFind')
+    finder = BallastFinder(d, interactive=True, assignOnlyUnassigned=args.command!='resetAndFind')
     ballasts = finder.run()
     print("{} ballasts found:".format(len(ballasts)))
     print(ballasts)
