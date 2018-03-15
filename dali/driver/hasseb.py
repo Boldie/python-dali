@@ -89,7 +89,7 @@ class HassebUsb(object):
     
         if responseExpected:
             # print "Reading endpoint ..."
-            retryCount = 40
+            retryCount = 100
             while True:
                 rdData = self.epRead.read(self.epRead.wMaxPacketSize)
                 
